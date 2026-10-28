@@ -107,3 +107,8 @@ CREATE TABLE IF NOT EXISTS log_compra_passagem (
     mensagem TEXT,
     data_hora TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE INDEX idx_voo_partida_status ON voo (data_hora_partida, status);
+CREATE INDEX idx_passagem_cliente ON passagem (cpf_cliente);
+CREATE INDEX idx_log_compra_data ON log_compra_passagem (data_hora);
+
