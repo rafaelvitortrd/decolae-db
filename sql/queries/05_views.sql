@@ -12,3 +12,4 @@ SELECT
 FROM voo v
 JOIN trajeto t ON v.id_trajeto = t.id_trajeto
 JOIN aeronave a ON v.id_aeronave = a.id_aeronave;
+

@@ -1,17 +1,8 @@
--- Decolae | 03 - Triggers e regras de negocio (versao revisada)
--- PostgreSQL 16+
--- EXECUTAR DEPOIS de 01_create_tables.sql e 02_seed_data_corrigido.sql.
--- Nao apaga voos, passagens ou usuarios existentes.
--- ATENCAO: este arquivo altera a restricao UNIQUE de passagem para permitir
--- reutilizar um assento apos o cancelamento, sem liberar assentos usados.
--- O fluxo de novos voos e: criar PROGRAMADO -> escalar tripulacao -> CONFIRMAR.
--- A politica didatica escolhida e 36 horas de descanso ENTRE voos.
+-- Triggers e regras de negocio 
 
 BEGIN;
 
--- 0. CORRECAO DE MODELO: ASSENTO CANCELADO PODE SER REVENDIDO
--- A UNIQUE original (id_voo, num_assento) bloqueava a reutilizacao de um assento
--- mesmo depois de uma passagem ter sido cancelada.
+
 ALTER TABLE passagem DROP CONSTRAINT IF EXISTS uq_voo_assento;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_voo_assento_ativo
     ON passagem (id_voo, num_assento)
@@ -27,7 +18,7 @@ BEGIN
     IF TG_OP = 'INSERT' THEN
         v_diminuir := (NEW.status = 'EMITIDA');
     ELSIF TG_OP = 'UPDATE' THEN
-        -- Transferir passagem para outro voo exigiria transacao propria.
+
         IF NEW.id_voo IS DISTINCT FROM OLD.id_voo THEN
             RAISE EXCEPTION 'Nao e permitido trocar o voo de uma passagem existente.';
         END IF;
@@ -41,7 +32,7 @@ BEGIN
     END IF;
 
     IF v_diminuir THEN
-        -- UPDATE e atomico; transacoes concorrentes disputam o mesmo voo.
+
         UPDATE voo
            SET assentos_disponiveis = assentos_disponiveis - 1
          WHERE id_voo = NEW.id_voo
@@ -79,7 +70,7 @@ BEGIN
         RETURN NEW;
     END IF;
 
-    -- Serializa tentativas concorrentes de alocar a mesma aeronave.
+
     PERFORM 1 FROM aeronave
      WHERE id_aeronave = NEW.id_aeronave FOR UPDATE;
 
@@ -118,7 +109,7 @@ BEGIN
         RETURN NEW;
     END IF;
 
-    -- Uma linha por profissional sincroniza tentativas concorrentes de escala.
+
     PERFORM 1 FROM tripulante
      WHERE id_tripulante = NEW.id_tripulante FOR UPDATE;
 
@@ -204,7 +195,7 @@ BEGIN
                 OLD.id_voo;
         END IF;
     END IF;
-    RETURN NULL; -- ignorado em triggers AFTER
+    RETURN NULL; 
 END;
 $$ LANGUAGE plpgsql;
 
@@ -255,13 +246,4 @@ FOR EACH ROW EXECUTE FUNCTION fn_revalidar_escala_voo();
 
 COMMIT;
 
--- OBSERVACOES PARA A DOCUMENTACAO:
--- * Os seeds sao anteriores a estes triggers. Nao ha efeito retroativo.
--- * A checagem de tripulacao usa tripulante.funcao, nao papel_no_voo.
--- * Nao sao tratadas aqui: validacao de assentos fisicos da aeronave,
---   alteracoes de funcao de tripulantes previamente escalados e
---   exclusao fisica de passagens (usar cancelamento, nao DELETE).
--- * O descanso de 36h entre quaisquer dois voos e uma politica CONSERVADORA,
---   escolhida para o TP; nao e um calculo de jornadas acumuladas de 12h.
--- * Para recriar do zero, rever o seed para iniciar voos PROGRAMADOS e
---   contar assentos a partir da capacidade, antes de inserir passagens.
+
