@@ -84,9 +84,13 @@ CREATE TABLE IF NOT EXISTS passagem (
     num_assento VARCHAR(5) NOT NULL,
     preco_pago NUMERIC(10, 2) NOT NULL CHECK (preco_pago > 0),
     data_compra TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    status VARCHAR(30) NOT NULL DEFAULT 'EMITIDA' CHECK (status IN ('EMITIDA', 'CANCELADA', 'UTILIZADA')),
-    CONSTRAINT uq_voo_assento UNIQUE (id_voo, num_assento)
+    status VARCHAR(30) NOT NULL DEFAULT 'EMITIDA'
+    CHECK (status IN ('EMITIDA', 'CANCELADA', 'UTILIZADA'))
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_passagem_assento_ativo
+ON passagem (id_voo, num_assento)
+WHERE status IN ('EMITIDA', 'UTILIZADA');
 
 CREATE TABLE IF NOT EXISTS log_auditoria (
     id_log SERIAL PRIMARY KEY,
@@ -108,7 +112,11 @@ CREATE TABLE IF NOT EXISTS log_compra_passagem (
     data_hora TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX idx_voo_partida_status ON voo (data_hora_partida, status);
-CREATE INDEX idx_passagem_cliente ON passagem (cpf_cliente);
-CREATE INDEX idx_log_compra_data ON log_compra_passagem (data_hora);
+CREATE INDEX IF NOT EXISTS idx_voo_partida_status
+ON voo (data_hora_partida, status);
 
+CREATE INDEX IF NOT EXISTS idx_passagem_cliente
+ON passagem (cpf_cliente);
+
+CREATE INDEX IF NOT EXISTS idx_log_compra_data
+ON log_compra_passagem (data_hora);

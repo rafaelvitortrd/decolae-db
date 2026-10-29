@@ -1,48 +1,64 @@
+-- Decolae | 03 - Triggers e regras de negocio (versao revisada)
+-- PostgreSQL 16+
+-- EXECUTAR DEPOIS de 01_create_tables.sql e 02_seed_data_corrigido.sql.
+-- Nao apaga voos, passagens ou usuarios existentes.
+-- ATENCAO: este arquivo altera a restricao UNIQUE de passagem para permitir
+-- reutilizar um assento apos o cancelamento, sem liberar assentos usados.
+-- O fluxo de novos voos e: criar PROGRAMADO -> escalar tripulacao -> CONFIRMAR.
+-- A politica didatica escolhida e 36 horas de descanso ENTRE voos.
 
--- 1. CONTROLE AUTOMÁTICO DE ASSENTOS E BLOQUEIO DE OVERBOOKING
--- Atualiza 'assentos_disponiveis' em 'voo' ao emitir ou cancelar passagens.
+BEGIN;
 
+-- 0. CORRECAO DE MODELO: ASSENTO CANCELADO PODE SER REVENDIDO
+-- A UNIQUE original (id_voo, num_assento) bloqueava a reutilizacao de um assento
+-- mesmo depois de uma passagem ter sido cancelada.
+ALTER TABLE passagem DROP CONSTRAINT IF EXISTS uq_voo_assento;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_voo_assento_ativo
+    ON passagem (id_voo, num_assento)
+    WHERE status IN ('EMITIDA', 'UTILIZADA');
+
+-- 1. ASSENTOS: BAIXA NA EMISSAO, REPOSICAO NO CANCELAMENTO
 CREATE OR REPLACE FUNCTION fn_gerenciar_assentos_passagem()
 RETURNS TRIGGER AS $$
 DECLARE
-    v_assentos_atuais INT;
+    v_diminuir BOOLEAN := FALSE;
+    v_aumentar BOOLEAN := FALSE;
 BEGIN
-    -- Ao emitir uma nova passagem
-    IF (TG_OP = 'INSERT') THEN
-        IF NEW.status = 'EMITIDA' THEN
-            SELECT assentos_disponiveis INTO v_assentos_atuais
-            FROM voo
-            WHERE id_voo = NEW.id_voo
-            FOR UPDATE;
+    IF TG_OP = 'INSERT' THEN
+        v_diminuir := (NEW.status = 'EMITIDA');
+    ELSIF TG_OP = 'UPDATE' THEN
+        -- Transferir passagem para outro voo exigiria transacao propria.
+        IF NEW.id_voo IS DISTINCT FROM OLD.id_voo THEN
+            RAISE EXCEPTION 'Nao e permitido trocar o voo de uma passagem existente.';
+        END IF;
+        IF (OLD.status = 'UTILIZADA' AND NEW.status = 'CANCELADA')
+           OR (OLD.status = 'CANCELADA' AND NEW.status = 'UTILIZADA') THEN
+            RAISE EXCEPTION 'Transicao de status de passagem nao permitida: % -> %.',
+                OLD.status, NEW.status;
+        END IF;
+        v_diminuir := (OLD.status = 'CANCELADA' AND NEW.status = 'EMITIDA');
+        v_aumentar := (OLD.status = 'EMITIDA' AND NEW.status = 'CANCELADA');
+    END IF;
 
-            IF v_assentos_atuais <= 0 THEN
-                RAISE EXCEPTION 'Operação cancelada: Voo % sem assentos disponíveis para reserva.', NEW.id_voo;
-            END IF;
-
-            UPDATE voo
-            SET assentos_disponiveis = assentos_disponiveis - 1
-            WHERE id_voo = NEW.id_voo;
+    IF v_diminuir THEN
+        -- UPDATE e atomico; transacoes concorrentes disputam o mesmo voo.
+        UPDATE voo
+           SET assentos_disponiveis = assentos_disponiveis - 1
+         WHERE id_voo = NEW.id_voo
+           AND assentos_disponiveis > 0;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'Voo % sem assentos disponiveis.', NEW.id_voo;
         END IF;
 
-    -- Ao alterar status da passagem (ex: cancelamento)
-    ELSIF (TG_OP = 'UPDATE') THEN
-        IF OLD.status = 'EMITIDA' AND NEW.status = 'CANCELADA' THEN
-            UPDATE voo
-            SET assentos_disponiveis = assentos_disponiveis + 1
-            WHERE id_voo = NEW.id_voo;
-        ELSIF OLD.status = 'CANCELADA' AND NEW.status = 'EMITIDA' THEN
-            SELECT assentos_disponiveis INTO v_assentos_atuais
-            FROM voo
-            WHERE id_voo = NEW.id_voo
-            FOR UPDATE;
-
-            IF v_assentos_atuais <= 0 THEN
-                RAISE EXCEPTION 'Operação cancelada: Voo % já atingiu a lotação máxima.', NEW.id_voo;
-            END IF;
-
-            UPDATE voo
-            SET assentos_disponiveis = assentos_disponiveis - 1
-            WHERE id_voo = NEW.id_voo;
+    ELSIF v_aumentar THEN
+        UPDATE voo v
+           SET assentos_disponiveis = v.assentos_disponiveis + 1
+          FROM aeronave a
+         WHERE v.id_voo = NEW.id_voo
+           AND a.id_aeronave = v.id_aeronave
+           AND v.assentos_disponiveis < a.capacidade;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'Inconsistencia de capacidade no voo %.', NEW.id_voo;
         END IF;
     END IF;
 
@@ -53,75 +69,72 @@ $$ LANGUAGE plpgsql;
 DROP TRIGGER IF EXISTS trg_gerenciar_assentos ON passagem;
 CREATE TRIGGER trg_gerenciar_assentos
 AFTER INSERT OR UPDATE ON passagem
-FOR EACH ROW
-EXECUTE FUNCTION fn_gerenciar_assentos_passagem();
+FOR EACH ROW EXECUTE FUNCTION fn_gerenciar_assentos_passagem();
 
-
-
--- 2. PREVENÇÃO DE CONFLITO DE HORÁRIOS DA AERONAVE
--- Impede que o mesmo avião esteja alocado em voos sobrepostos no tempo.
-
-
+-- 2. IMPEDIR DOIS VOOS ATIVOS SIMULTANEOS COM A MESMA AERONAVE
 CREATE OR REPLACE FUNCTION fn_validar_conflito_aeronave()
 RETURNS TRIGGER AS $$
-DECLARE
-    v_conflito INT;
 BEGIN
-    SELECT COUNT(*) INTO v_conflito
-    FROM voo
-    WHERE id_aeronave = NEW.id_aeronave
-      AND id_voo != COALESCE(NEW.id_voo, -1)
-      AND status != 'CANCELADO'
-      AND (
-          (NEW.data_hora_partida, NEW.data_hora_chegada) OVERLAPS (data_hora_partida, data_hora_chegada)
-      );
-
-    IF v_conflito > 0 THEN
-        RAISE EXCEPTION 'Conflito de malha aérea: Aeronave % já alocada em voo conflitante nesse intervalo.', NEW.id_aeronave;
+    IF NEW.status = 'CANCELADO' THEN
+        RETURN NEW;
     END IF;
 
+    -- Serializa tentativas concorrentes de alocar a mesma aeronave.
+    PERFORM 1 FROM aeronave
+     WHERE id_aeronave = NEW.id_aeronave FOR UPDATE;
+
+    IF EXISTS (
+        SELECT 1 FROM voo v
+         WHERE v.id_aeronave = NEW.id_aeronave
+           AND v.id_voo <> COALESCE(NEW.id_voo, -1)
+           AND v.status <> 'CANCELADO'
+           AND (NEW.data_hora_partida, NEW.data_hora_chegada)
+               OVERLAPS (v.data_hora_partida, v.data_hora_chegada)
+    ) THEN
+        RAISE EXCEPTION 'Aeronave % ocupada no intervalo informado.', NEW.id_aeronave;
+    END IF;
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 
 DROP TRIGGER IF EXISTS trg_validar_conflito_aeronave ON voo;
 CREATE TRIGGER trg_validar_conflito_aeronave
-BEFORE INSERT OR UPDATE ON voo
-FOR EACH ROW
-EXECUTE FUNCTION fn_validar_conflito_aeronave();
+BEFORE INSERT OR UPDATE OF id_aeronave, data_hora_partida, data_hora_chegada, status
+ON voo FOR EACH ROW EXECUTE FUNCTION fn_validar_conflito_aeronave();
 
-
-
--- 3. PREVENÇÃO DE CHOQUE DE ESCALA DE TRIPULANTE
--- Impede que um tripulante seja escalado para voos com horários coincidentes.
-
-
+-- 3. IMPEDIR CONFLITO DE ESCALA E EXIGIR DESCANSO DE 36 HORAS
 CREATE OR REPLACE FUNCTION fn_validar_conflito_tripulante()
 RETURNS TRIGGER AS $$
 DECLARE
-    v_partida_novo TIMESTAMP;
-    v_chegada_novo TIMESTAMP;
-    v_conflito INT;
+    v_partida TIMESTAMP;
+    v_chegada TIMESTAMP;
+    v_status VARCHAR(30);
 BEGIN
-    SELECT data_hora_partida, data_hora_chegada
-    INTO v_partida_novo, v_chegada_novo
-    FROM voo
-    WHERE id_voo = NEW.id_voo;
+    SELECT data_hora_partida, data_hora_chegada, status
+      INTO v_partida, v_chegada, v_status
+      FROM voo WHERE id_voo = NEW.id_voo;
 
-    SELECT COUNT(*) INTO v_conflito
-    FROM escala_tripulante_voo e
-    JOIN voo v ON e.id_voo = v.id_voo
-    WHERE e.id_tripulante = NEW.id_tripulante
-      AND e.id_voo != NEW.id_voo
-      AND v.status != 'CANCELADO'
-      AND (
-          (v_partida_novo, v_chegada_novo) OVERLAPS (v.data_hora_partida, v.data_hora_chegada)
-      );
-
-    IF v_conflito > 0 THEN
-        RAISE EXCEPTION 'Conflito de escala: Tripulante % já possui voo agendado nesse intervalo.', NEW.id_tripulante;
+    IF v_status = 'CANCELADO' THEN
+        RETURN NEW;
     END IF;
 
+    -- Uma linha por profissional sincroniza tentativas concorrentes de escala.
+    PERFORM 1 FROM tripulante
+     WHERE id_tripulante = NEW.id_tripulante FOR UPDATE;
+
+    IF EXISTS (
+        SELECT 1
+          FROM escala_tripulante_voo e
+          JOIN voo v ON v.id_voo = e.id_voo
+         WHERE e.id_tripulante = NEW.id_tripulante
+           AND e.id_voo <> NEW.id_voo
+           AND v.status <> 'CANCELADO'
+           AND v_partida < v.data_hora_chegada + INTERVAL '36 hours'
+           AND v.data_hora_partida < v_chegada + INTERVAL '36 hours'
+    ) THEN
+        RAISE EXCEPTION 'Tripulante % em conflito de escala ou descanso inferior a 36 horas.',
+            NEW.id_tripulante;
+    END IF;
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
@@ -129,47 +142,126 @@ $$ LANGUAGE plpgsql;
 DROP TRIGGER IF EXISTS trg_validar_conflito_tripulante ON escala_tripulante_voo;
 CREATE TRIGGER trg_validar_conflito_tripulante
 BEFORE INSERT OR UPDATE ON escala_tripulante_voo
-FOR EACH ROW
-EXECUTE FUNCTION fn_validar_conflito_tripulante();
+FOR EACH ROW EXECUTE FUNCTION fn_validar_conflito_tripulante();
 
-
-
--- 4. VALIDAÇÃO DE TRIPULAÇÃO MÍNIMA AO CONFIRMAR VOO
--- Exige pelo menos 1 Piloto, 1 Copiloto e 2 Comissários para confirmar o voo.
-
-
+-- 4. EXIGIR 1 PILOTO, 1 COPILOTO E 2 COMISSARIOS PARA CONFIRMAR
 CREATE OR REPLACE FUNCTION fn_validar_tripulacao_minima()
 RETURNS TRIGGER AS $$
 DECLARE
-    v_qtd_piloto INT;
-    v_qtd_copiloto INT;
-    v_qtd_comissario INT;
+    v_pilotos BIGINT;
+    v_copilotos BIGINT;
+    v_comissarios BIGINT;
 BEGIN
-    IF NEW.status = 'CONFIRMADO' AND (OLD.status IS NULL OR OLD.status != 'CONFIRMADO') THEN
-        SELECT 
-            COUNT(*) FILTER (WHERE t.funcao = 'PILOTO'),
-            COUNT(*) FILTER (WHERE t.funcao = 'COPILOTO'),
-            COUNT(*) FILTER (WHERE t.funcao = 'COMISSARIO')
-        INTO 
-            v_qtd_piloto,
-            v_qtd_copiloto,
-            v_qtd_comissario
-        FROM escala_tripulante_voo e
-        JOIN tripulante t ON e.id_tripulante = t.id_tripulante
-        WHERE e.id_voo = NEW.id_voo;
-
-        IF v_qtd_piloto < 1 OR v_qtd_copiloto < 1 OR v_qtd_comissario < 2 THEN
-            RAISE EXCEPTION 'Voo % não pode ser confirmado. Tripulação mínima incompleta (Pilotos: %, Copilotos: %, Comissários: %). Exige-se min 1/1/2.',
-                NEW.id_voo, v_qtd_piloto, v_qtd_copiloto, v_qtd_comissario;
+    IF TG_OP = 'INSERT' THEN
+        IF NEW.status = 'CONFIRMADO' THEN
+            RAISE EXCEPTION 'Crie o voo como PROGRAMADO, escale a equipe e depois confirme.';
         END IF;
+        RETURN NEW;
     END IF;
 
+    IF NEW.status = 'CONFIRMADO' AND OLD.status IS DISTINCT FROM 'CONFIRMADO' THEN
+        SELECT COUNT(*) FILTER (WHERE t.funcao = 'PILOTO'),
+               COUNT(*) FILTER (WHERE t.funcao = 'COPILOTO'),
+               COUNT(*) FILTER (WHERE t.funcao = 'COMISSARIO')
+          INTO v_pilotos, v_copilotos, v_comissarios
+          FROM escala_tripulante_voo e
+          JOIN tripulante t ON t.id_tripulante = e.id_tripulante
+         WHERE e.id_voo = NEW.id_voo;
+
+        IF v_pilotos < 1 OR v_copilotos < 1 OR v_comissarios < 2 THEN
+            RAISE EXCEPTION 'Voo %: tripulacao insuficiente (pilotos %, copilotos %, comissarios %).',
+                NEW.id_voo, v_pilotos, v_copilotos, v_comissarios;
+        END IF;
+    END IF;
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 
 DROP TRIGGER IF EXISTS trg_validar_tripulacao_minima ON voo;
 CREATE TRIGGER trg_validar_tripulacao_minima
-BEFORE UPDATE ON voo
-FOR EACH ROW
-EXECUTE FUNCTION fn_validar_tripulacao_minima();
+BEFORE INSERT OR UPDATE OF status ON voo
+FOR EACH ROW EXECUTE FUNCTION fn_validar_tripulacao_minima();
+
+-- 5. NAO DEIXAR VOO CONFIRMADO PERDER TRIPULACAO OBRIGATORIA
+CREATE OR REPLACE FUNCTION fn_proteger_tripulacao_confirmada()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_pilotos BIGINT;
+    v_copilotos BIGINT;
+    v_comissarios BIGINT;
+BEGIN
+    IF EXISTS (SELECT 1 FROM voo WHERE id_voo = OLD.id_voo AND status = 'CONFIRMADO') THEN
+        SELECT COUNT(*) FILTER (WHERE t.funcao = 'PILOTO'),
+               COUNT(*) FILTER (WHERE t.funcao = 'COPILOTO'),
+               COUNT(*) FILTER (WHERE t.funcao = 'COMISSARIO')
+          INTO v_pilotos, v_copilotos, v_comissarios
+          FROM escala_tripulante_voo e
+          JOIN tripulante t ON t.id_tripulante = e.id_tripulante
+         WHERE e.id_voo = OLD.id_voo;
+
+        IF v_pilotos < 1 OR v_copilotos < 1 OR v_comissarios < 2 THEN
+            RAISE EXCEPTION 'Nao e permitido deixar o voo confirmado % com equipe incompleta.',
+                OLD.id_voo;
+        END IF;
+    END IF;
+    RETURN NULL; -- ignorado em triggers AFTER
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_proteger_tripulacao_confirmada ON escala_tripulante_voo;
+CREATE TRIGGER trg_proteger_tripulacao_confirmada
+AFTER DELETE OR UPDATE OF id_voo, id_tripulante ON escala_tripulante_voo
+FOR EACH ROW EXECUTE FUNCTION fn_proteger_tripulacao_confirmada();
+
+-- 6. REVALIDAR DESCANSO SE O HORARIO DO VOO FOR ALTERADO
+CREATE OR REPLACE FUNCTION fn_revalidar_escala_voo()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_id_tripulante INT;
+BEGIN
+    IF NEW.status = 'CANCELADO' THEN
+        RETURN NULL;
+    END IF;
+
+    FOR v_id_tripulante IN
+        SELECT id_tripulante FROM escala_tripulante_voo
+         WHERE id_voo = NEW.id_voo ORDER BY id_tripulante
+    LOOP
+        PERFORM 1 FROM tripulante
+         WHERE id_tripulante = v_id_tripulante FOR UPDATE;
+
+        IF EXISTS (
+            SELECT 1
+              FROM escala_tripulante_voo e
+              JOIN voo v ON v.id_voo = e.id_voo
+             WHERE e.id_tripulante = v_id_tripulante
+               AND e.id_voo <> NEW.id_voo
+               AND v.status <> 'CANCELADO'
+               AND NEW.data_hora_partida < v.data_hora_chegada + INTERVAL '36 hours'
+               AND v.data_hora_partida < NEW.data_hora_chegada + INTERVAL '36 hours'
+        ) THEN
+            RAISE EXCEPTION 'Alteracao do voo % gera conflito de descanso para tripulante %.',
+                NEW.id_voo, v_id_tripulante;
+        END IF;
+    END LOOP;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_revalidar_escala_voo ON voo;
+CREATE TRIGGER trg_revalidar_escala_voo
+AFTER UPDATE OF data_hora_partida, data_hora_chegada, status ON voo
+FOR EACH ROW EXECUTE FUNCTION fn_revalidar_escala_voo();
+
+COMMIT;
+
+-- OBSERVACOES PARA A DOCUMENTACAO:
+-- * Os seeds sao anteriores a estes triggers. Nao ha efeito retroativo.
+-- * A checagem de tripulacao usa tripulante.funcao, nao papel_no_voo.
+-- * Nao sao tratadas aqui: validacao de assentos fisicos da aeronave,
+--   alteracoes de funcao de tripulantes previamente escalados e
+--   exclusao fisica de passagens (usar cancelamento, nao DELETE).
+-- * O descanso de 36h entre quaisquer dois voos e uma politica CONSERVADORA,
+--   escolhida para o TP; nao e um calculo de jornadas acumuladas de 12h.
+-- * Para recriar do zero, rever o seed para iniciar voos PROGRAMADOS e
+--   contar assentos a partir da capacidade, antes de inserir passagens.
